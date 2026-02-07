@@ -1,0 +1,166 @@
+version: '3.9'
+
+services:
+  # PostgreSQL Database with pgvector
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: voice_to_task_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voicetask}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voicetask_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-voice_to_task}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voicetask}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - voice_task_network
+
+  # Redis for Celery Task Queue
+  redis:
+    image: redis:7-alpine
+    container_name: voice_to_task_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - voice_task_network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_to_task_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-voicetask}:${POSTGRES_PASSWORD:-voicetask_secret}@postgres:5432/${POSTGRES_DB:-voice_to_task}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - voice_task_network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_to_task_worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-voicetask}:${POSTGRES_PASSWORD:-voicetask_secret}@postgres:5432/${POSTGRES_DB:-voice_to_task}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - voice_task_network
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4
+
+  # Celery Beat Scheduler
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_to_task_beat
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-voicetask}:${POSTGRES_PASSWORD:-voicetask_secret}@postgres:5432/${POSTGRES_DB:-voice_to_task}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app
+    depends_on:
+      - celery_worker
+    networks:
+      - voice_task_network
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  # Flower - Celery Monitoring
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: voice_to_task_flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - celery_worker
+    networks:
+      - voice_task_network
+    command: celery -A app.workers.celery_app flower --port=5555
+
+  # React Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: voice_to_task_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    depends_on:
+      - backend
+    networks:
+      - voice_task_network
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  voice_task_network:
+    driver: bridge
